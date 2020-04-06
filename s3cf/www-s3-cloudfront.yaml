@@ -1,0 +1,672 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Resources for hosting Acorn on S3 and CloudFront.
+###############################################################################
+Parameters:
+###############################################################################
+
+  ### CloudFront Parameters ###
+  AcmCertificateArn:
+    Type: String
+    Description: >
+      The ARN of the SSL certificate to use for the CloudFront distribution.
+  DomainName:
+    Type: String
+    Description: The website domain name.
+    Default: j.kingsmill.io
+  PriceClass:
+    Type: String
+    Description: The CloudFront distribution price class
+    Default: 'PriceClass_All'
+    AllowedValues:
+      - 'PriceClass_100'
+      - 'PriceClass_200'
+      - 'PriceClass_All'
+  ### WAF Parameters ###
+  ruleAction:
+    Type: String
+    Description: The type of action you want to iplement for the rules in this set. Valid options are COUNT or BLOCK.
+    AllowedValues:
+      - BLOCK
+      - COUNT
+    Default: BLOCK
+  stackPrefix:
+    Type: String
+    Description: The prefix to use when naming resources in this stack.
+    ConstraintDescription: Alphanumeric characters only, maximum 10 characters
+    AllowedPattern: ^[a-zA-z0-9]+$
+    MaxLength: 10
+    Default: "s3www"
+  includesPrefix:
+    Type: String
+    Description: This is the URI path prefix (starting with '/') that identifies any files in your webroot that are server-side included components, and should not be invoked directly via URL. These can be headers, footers, 3rd party server side libraries or components. You can add additional prefixes later directly in the set.
+    Default: /includes
+  adminUrlPrefix:
+    Type: String
+    Description: This is the URI path prefix (starting with '/') that identifies your administrative sub-site. You can add additional prefixes later directly in the set.
+    Default: /admin
+  adminRemoteCidr:
+    Type: String
+    Description: This is the IP address allowed to access your administrative interface. Use CIDR notation. You can add additional ones later directly in the set.
+    Default: 127.0.0.1/32
+  maxExpectedURISize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the URI component of the HTTP request. Generally the maximum possible value is determined by the server operating system (maps to file system paths), the web server software, or other middleware components. Choose a value that accomodates the largest URI segment you use in practice in your web application.
+    Default: 512
+  maxExpectedQueryStringSize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the query string component of the HTTP request. Normally the  of query string parameters following the "?" in a URL is much larger than the URI , but still bounded by the  of the parameters your web application uses and their values.
+    Default: 1024
+  maxExpectedBodySize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the body of the request. If you do not plan to allow large uploads, set it to the largest payload value that makes sense for your web application. Accepting unnecessarily large values can cause performance issues, if large payloads are used as an attack vector against your web application.
+    Default: 4096
+  maxExpectedCookieSize:
+    Type: Number
+    Description: Maximum number of bytes allowed in the cookie header. The maximum size should be less than 4096, the size is determined by the amount of information your web application stores in cookies. If you only pass a session token via cookies, set the size to no larger than the serialized size of the session token and cookie metadata.
+    Default: 4093
+  csrfExpectedHeader:
+    Type: String
+    Description: The custom HTTP request header, where the CSRF token value is expected to be encountered
+    Default: x-csrf-token
+  csrfExpectedSize:
+    Type: Number
+    Description: The size in bytes of the CSRF token value. For example if it's a canonically formatted UUIDv4 value the expected size would be 36 bytes/ASCII characters
+    Default: 36
+
+###############################################################################
+Resources:
+###############################################################################
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        DefaultCacheBehavior:
+          Compress: true
+          DefaultTTL: 5
+          ForwardedValues:
+            QueryString: false
+          MaxTTL: 5
+          MinTTL: 0
+          TargetOriginId: s3-bucket
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - DomainName:
+              !Join [ "", [ !Ref Bucket, ".s3.amazonaws.com" ] ]
+            Id: s3-bucket
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Join [ "", [ "origin-access-identity/cloudfront/", !Ref CloudFrontOriginAccessIdentity ] ]
+        PriceClass: !Ref PriceClass
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          MinimumProtocolVersion: TLSv1
+          SslSupportMethod: sni-only
+        WebACLId: !Ref wafgOwaspACL
+      Tags:
+        - Key: Domain
+          Value: !Ref DomainName
+
+  CloudFrontOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'CloudFront OAI for ${DomainName}'
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      # BucketEncryption:
+      #   ServerSideEncryptionConfiguration: 
+      #     -
+      #       ServerSideEncryptionByDefault:
+      #         SSEAlgorithm: AES256
+      BucketName: 'acorn-www-bucket'
+      Tags:
+        - Key: Domain
+          Value: !Ref DomainName
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Join [ "", [ "arn:aws:s3:::", !Ref Bucket, "/*" ] ]
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOriginAccessIdentity.S3CanonicalUserId
+
+
+## 1.
+## OWASP Top 10 A1
+## Mitigate SQL Injection Attacks
+## Matches attempted SQLi patterns in the URI, QUERY_STRING, BODY, COOKIES
+  wafgSQLiSet:
+    Type: AWS::WAF::SqlInjectionMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-sqli']]
+      SqlInjectionMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: BODY
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: BODY
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          TextTransformation: HTML_ENTITY_DECODE
+  wafgSQLiRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'mitigatesqli']]
+      Name: !Join ['-', [!Ref stackPrefix, 'mitigate-sqli']]
+      Predicates:
+        - Type: SqlInjectionMatch
+          Negated: false
+          DataId: !Ref wafgSQLiSet
+
+## 2.
+## OWASP Top 10 A2
+## Blacklist bad/hijacked JWT tokens or session IDs
+## Matches the specific values in the cookie or Authorization header
+## for JWT it is sufficient to check the signature
+
+  wafgAuthTokenStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-auth-tokens']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          PositionalConstraint: CONTAINS
+          TargetString: example-session-id
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: HEADER
+            Data: authorization
+          PositionalConstraint: ENDS_WITH
+          TargetString: .TJVA95OrM7E2cBab30RMHrHDcEfxjoYZgeFONFh7HgQ
+          TextTransformation: URL_DECODE
+  wafgAuthTokenRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'badauthtokens']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-bad-auth-tokens']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgAuthTokenStringSet
+
+## 3.
+## OWASP Top 10 A3
+## Mitigate Cross Site Scripting Attacks
+## Matches attempted XSS patterns in the URI, QUERY_STRING, BODY, COOKIES
+  wafgXSSSet:
+    Type: AWS::WAF::XssMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-xss']]
+      XssMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: BODY
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: BODY
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          TextTransformation: HTML_ENTITY_DECODE
+  wafgXSSRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'mitigatexss']]
+      Name: !Join ['-', [!Ref stackPrefix, 'mitigate-xss']]
+      Predicates:
+        - Type: XssMatch
+          Negated: false
+          DataId: !Ref wafgXSSSet
+
+## 4.
+## OWASP Top 10 A4
+## Path Traversal, LFI, RFI
+## Matches request patterns designed to traverse filesystem paths, and include
+## local or remote files
+
+  wafgPathsStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-rfi-lfi-traversal']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: CONTAINS
+          TargetString: ../
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: CONTAINS
+          TargetString: ../
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: ../
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: ../
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: CONTAINS
+          TargetString: ://
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: CONTAINS
+          TargetString: ://
+          TextTransformation: HTML_ENTITY_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: ://
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: ://
+          TextTransformation: HTML_ENTITY_DECODE
+  wafgPathsRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'detectrfilfi']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-rfi-lfi-traversal']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgPathsStringSet
+
+## 5.
+## OWASP Top 10 A4
+## Privileged Module Access Restrictions
+## Restrict access to the admin interface to known source IPs only
+## Matches the URI prefix, when the remote IP isn't in the whitelist
+
+  wafgAdminUrlStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-admin-url']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: STARTS_WITH
+          TargetString: !Ref adminUrlPrefix
+          TextTransformation: URL_DECODE
+  wafgAdminRemoteAddrIpSet:
+    Type: AWS::WAF::IPSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-admin-remote-ip']]
+      IPSetDescriptors:
+        - Type: IPV4
+          Value: !Ref adminRemoteCidr
+  wafgAdminAccessRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'detectadminaccess']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-admin-access']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgAdminUrlStringSet
+        - Type: IPMatch
+          Negated: true
+          DataId: !Ref wafgAdminRemoteAddrIpSet
+
+## 6.
+## OWASP Top 10 A5
+## PHP Specific Security Misconfigurations
+## Matches request patterns designed to exploit insecure PHP/CGI configuration
+
+  wafgPHPInsecureQSStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-php-insecure-var-refs']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: _SERVER[
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: _ENV[
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: auto_prepend_file=
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: auto_append_file=
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: allow_url_include=
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: disable_functions=
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: open_basedir=
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: QUERY_STRING
+          PositionalConstraint: CONTAINS
+          TargetString: safe_mode=
+          TextTransformation: URL_DECODE
+  wafgPHPInsecureURIStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-php-insecure-uri']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: php
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: /
+          TextTransformation: URL_DECODE
+  wafgPHPInsecureRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'detectphpinsecure']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-php-insecure']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgPHPInsecureQSStringSet
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgPHPInsecureURIStringSet
+
+## 7.
+## OWASP Top 10 A7
+## Mitigate abnormal requests via size restrictions
+## Enforce consistent request hygene, limit size of key elements
+  
+  wafgSizeRestrictionSet:
+    Type: AWS::WAF::SizeConstraintSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'size-restrictions']]
+      SizeConstraints:
+        - FieldToMatch:
+            Type: URI
+          TextTransformation: NONE
+          ComparisonOperator: GT
+          Size: !Ref maxExpectedURISize
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: NONE
+          ComparisonOperator: GT
+          Size: !Ref maxExpectedQueryStringSize
+        - FieldToMatch:
+            Type: BODY
+          TextTransformation: NONE
+          ComparisonOperator: GT
+          Size: !Ref maxExpectedBodySize
+        - FieldToMatch:
+            Type: HEADER
+            Data: cookie
+          TextTransformation: NONE
+          ComparisonOperator: GT
+          Size: !Ref maxExpectedCookieSize
+  wafgSizeRestrictionRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'restrictsizes']]
+      Name: !Join ['-', [!Ref stackPrefix, 'restrict-sizes']]
+      Predicates:
+        - Type: SizeConstraint
+          Negated: false
+          DataId: !Ref wafgSizeRestrictionSet
+
+
+## 8.
+## OWASP Top 10 A8
+## CSRF token enforcement example
+## Enforce the presence of CSRF token in request header
+  wafgCSRFMethodStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-csrf-method']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: METHOD
+          PositionalConstraint: EXACTLY
+          TargetString: post
+          TextTransformation: LOWERCASE
+  wafgCSRFTokenSizeConstraint:
+    Type: AWS::WAF::SizeConstraintSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-csrf-token']]
+      SizeConstraints:
+        - FieldToMatch:
+            Type: HEADER
+            Data: !Ref csrfExpectedHeader
+          TextTransformation: NONE
+          ComparisonOperator: EQ
+          Size: !Ref csrfExpectedSize
+  wafgCSRFRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'enforcecsrf']]
+      Name: !Join ['-', [!Ref stackPrefix, 'enforce-csrf']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgCSRFMethodStringSet
+        - Type: SizeConstraint
+          Negated: true
+          DataId: !Ref wafgCSRFTokenSizeConstraint
+
+## 9.
+## OWASP Top 10 A9
+## Server-side includes & libraries in webroot
+## Matches request patterns for webroot objects that shouldn't be directly accessible
+  wafgServerSideIncludeStringSet:
+    Type: AWS::WAF::ByteMatchSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-ssi']]
+      ByteMatchTuples:
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: STARTS_WITH
+          TargetString: !Ref includesPrefix
+          TextTransformation: URL_DECODE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .cfg
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .conf
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .config
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .ini
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .log
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .bak
+          TextTransformation: LOWERCASE
+        - FieldToMatch:
+            Type: URI
+          PositionalConstraint: ENDS_WITH
+          TargetString: .backup
+          TextTransformation: LOWERCASE
+  wafgServerSideIncludeRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'detectssi']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-ssi']]
+      Predicates:
+        - Type: ByteMatch
+          Negated: false
+          DataId: !Ref wafgServerSideIncludeStringSet
+
+## 10.
+## Generic
+## IP Blacklist
+## Matches IP addresses that should not be allowed to access content
+  wafgBlacklistIpSet:
+    Type: AWS::WAF::IPSet
+    Properties:
+      Name: !Join ['-', [!Ref stackPrefix, 'match-blacklisted-ips']]
+      IPSetDescriptors:
+        - Type: IPV4
+          Value: 10.0.0.0/8
+        - Type: IPV4
+          Value: 192.168.0.0/16
+        - Type: IPV4
+          Value: 169.254.0.0/16
+        - Type: IPV4
+          Value: 172.16.0.0/16
+        - Type: IPV4
+          Value: 127.0.0.1/32
+  wafgBlacklistIpRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'blacklistedips']]
+      Name: !Join ['-', [!Ref stackPrefix, 'detect-blacklisted-ips']]
+      Predicates:
+        - Type: IPMatch
+          Negated: false
+          DataId: !Ref wafgBlacklistIpSet
+
+
+## --
+## WebACL containing the above rules evaluated in-order
+  wafgOwaspACL:
+    Type: AWS::WAF::WebACL
+    Properties:
+      MetricName: !Join ['', [!Ref stackPrefix, 'owaspacl']]
+      Name: !Join ['-', [!Ref stackPrefix, 'owasp-acl']]
+      DefaultAction:
+        Type: ALLOW
+      Rules:
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 10
+          RuleId: !Ref wafgSizeRestrictionRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 20
+          RuleId: !Ref wafgBlacklistIpRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 30
+          RuleId: !Ref wafgAuthTokenRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 40
+          RuleId: !Ref wafgSQLiRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 50
+          RuleId: !Ref wafgXSSRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 60
+          RuleId: !Ref wafgPathsRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 70
+          RuleId: !Ref wafgPHPInsecureRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 80
+          RuleId: !Ref wafgCSRFRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 90
+          RuleId: !Ref wafgServerSideIncludeRule
+        - Action:
+            Type: !Ref ruleAction
+          Priority: 100
+          RuleId: !Ref wafgAdminAccessRule

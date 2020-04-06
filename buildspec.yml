@@ -1,0 +1,30 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+        python: 3.7
+    commands:
+      - echo "Installing AWS SAM..."
+      # - pip3 install --user aws-sam-cli
+      # - echo "Including Python3 User Base path in $PATH..."
+      # - USER_BASE_PATH=$(python3 -m site --user-base)
+      # - export PATH=$PATH:$USER_BASE_PATH/bin
+  build:
+    commands:
+      # - echo "Deploying Cloudformation resources - S3 bucket, WAF, and CloudFront distribution..."
+      # - cd s3cf
+      # - aws cloudformation update-stack --template-body file://www-s3-cloudfront.yaml --stack-name acorn-www --parameters ParameterKey=AcmCertificateArn,ParameterValue='arn:aws:acm:us-east-1:288787507018:certificate/ce332547-12c9-4a1e-bf0a-2c43004351f7' || true
+      # - cd ..
+      # - echo "Deploying SAM resources - API Gateway, Lambda, and DynamoDB..."
+      # - cd backend/
+      # - sam package --template-file ./template.yaml --output-template-file ./packaged.yaml --s3-bucket jk-sls-bucket
+      # - sam deploy --template-file ./packaged.yaml --stack-name acorn-reports --capabilities CAPABILITY_IAM
+      # - cd ..
+      # - echo "Deploying frontend..."
+      - cd frontend/
+      - aws s3 sync . s3://acorn-www-bucket/ --sse AES256
+  post_build:
+    commands:
+      - echo "Running tests..."
+      - curl -L -s -o "/dev/null" j.kingsmill.io || exit 1

@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'MB3 Reports SAM Stack for adding Acorn reports
+
+  '
+Globals:
+  Function:
+    Timeout: 3
+  Api:
+    Cors:
+      AllowOrigin: '''*'''
+      AllowHeaders: '''*'''
+      AllowMethods: '''*'''
+Resources:
+  AddReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://jk-sls-bucket/99c50d473c947f21f21710047f80b8df
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: acornDDB
+      AutoPublishAlias: live
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties:
+            Path: /add
+            Method: post
+  GetReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://jk-sls-bucket/5b7b10ac3c129debba06ad0ab208d554
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: acornDDB
+      AutoPublishAlias: live
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            Path: /get
+            Method: get
+  acornDDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: UserID
+        AttributeType: S
+      - AttributeName: Date
+        AttributeType: S
+      KeySchema:
+      - AttributeName: UserID
+        KeyType: HASH
+      - AttributeName: Date
+        KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: '1'
+        WriteCapacityUnits: '1'
+      TableName: acorn2
+  AliasErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: Resource
+        Value:
+          Fn::Sub: ${AddReportFunction}:live
+      - Name: FunctionName
+        Value:
+          Ref: AddReportFunction
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+  LatestVersionErrorMetricGreaterThanZeroAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda Function Error > 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: Resource
+        Value:
+          Fn::Sub: ${AddReportFunction}:live
+      - Name: FunctionName
+        Value:
+          Ref: AddReportFunction
+      - Name: ExecutedVersion
+        Value:
+          Fn::GetAtt:
+          - AddReportFunction
+          - Version.Version
+      EvaluationPeriods: 2
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Threshold: 0
+Outputs:
+  AddReportApi:
+    Description: API Gateway endpoint URL for Prod stage for Hello World function
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/add/
+  AddReportFunction:
+    Description: Add Report Lambda Function ARN
+    Value:
+      Fn::GetAtt:
+      - AddReportFunction
+      - Arn
+  HelloWorldFunctionIamRole:
+    Description: Implicit IAM Role created for Add Report function
+    Value:
+      Fn::GetAtt:
+      - AddReportFunctionRole
+      - Arn
